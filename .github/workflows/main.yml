@@ -1,0 +1,1683 @@
+name: Build plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build VST3
+        run: cmake --build build --config Release --target Jovian8_VST3 Sampler16_VST3 --parallel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows-VST3
+          path: build/*_artefacts/Release/VST3/
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -G Xcode
+      - name: Build AU + VST3
+        run: cmake --build build --config Release --target Jovian8_AU Jovian8_VST3 Sampler16_AU Sampler16_VST3 --parallel
+      - name: Signature ad hoc et archives
+        run: |
+          mkdir out
+          for f in build/*_artefacts/Release/AU/*.component build/*_artefacts/Release/VST3/*.vst3; do
+            codesign --force --deep --sign - "$f"
+            ditto -c -k --keepParent "$f" "out/$(basename "$f").zip"
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS-AU-VST3
+          path: out/
+
+cmake_minimum_required(VERSION 3.22)
+# macOS : binaire universel (Apple Silicon M1 + Intel), compatible macOS 11+
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
+
+project(Jovian8 VERSION 1.0.0)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Runtime Visual C++ lié statiquement : pas besoin d'installer de redistribuable sur la machine de musique
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+include(FetchContent)
+FetchContent_Declare(JUCE
+    GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+    GIT_TAG 8.0.4
+    GIT_SHALLOW ON)
+FetchContent_MakeAvailable(JUCE)
+
+if(APPLE)
+    set(JOVIAN_FORMATS VST3 AU Standalone)   # AU = format lu par GarageBand / Logic
+else()
+    set(JOVIAN_FORMATS VST3 Standalone)
+endif()
+
+juce_add_plugin(Jovian8
+    COMPANY_NAME "KoalaAudio"
+    PLUGIN_MANUFACTURER_CODE Koal
+    PLUGIN_CODE Jov8
+    FORMATS ${JOVIAN_FORMATS}
+    PRODUCT_NAME "Jovian8"
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
+    NEEDS_MIDI_OUTPUT FALSE
+    VST3_CATEGORIES Instrument Synth
+    COPY_PLUGIN_AFTER_BUILD FALSE)
+
+target_sources(Jovian8 PRIVATE
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp)
+
+target_compile_definitions(Jovian8 PUBLIC
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0)
+
+target_link_libraries(Jovian8
+    PRIVATE
+        juce::juce_audio_utils
+        juce::juce_dsp
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags)
+
+# ---------------------------------------------------------------- Sampler16 (sampler 16 pads + séquenceur)
+juce_add_plugin(Sampler16
+    COMPANY_NAME "KoalaAudio"
+    PLUGIN_MANUFACTURER_CODE Koal
+    PLUGIN_CODE Smp6
+    FORMATS ${JOVIAN_FORMATS}
+    PRODUCT_NAME "Sampler16"
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
+    NEEDS_MIDI_OUTPUT FALSE
+    VST3_CATEGORIES Instrument Sampler
+    COPY_PLUGIN_AFTER_BUILD FALSE)
+
+target_sources(Sampler16 PRIVATE
+    Sampler/Source/SamplerProcessor.cpp
+    Sampler/Source/SamplerEditor.cpp)
+
+target_compile_definitions(Sampler16 PUBLIC
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_USE_MP3AUDIOFORMAT=1)
+
+target_link_libraries(Sampler16
+    PRIVATE
+        juce::juce_audio_utils
+        juce::juce_audio_formats
+        juce::juce_dsp
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags)
+
+# Jovian 8 — synthé VST3 (Windows 10 / Cubase 9.5)
+
+Synthé polyphonique analogique virtuel 8 voix, inspiré de l'architecture des grands synthés polyphoniques des années 80.
+Créé avec JUCE 8 (C++), format **VST3 64 bits**.
+
+## Fonctions
+- 8 voix, modes **Poly / Unison / Mono**, glide, pédale de sustain, pitch bend, molette de modulation
+- 2 VCO (Tri / Saw / Pulse / Carré, 16'–2'), **sync**, **cross-mod**, PWM par LFO, bruit
+- HPF + VCF résonant **12 dB / 24 dB**, suivi de clavier, enveloppe et LFO vers le filtre
+- 2 enveloppes ADSR (filtre et ampli), LFO (Tri / Saw / Carré / S&H) avec retard
+- Chorus I / II, largeur stéréo
+- **Arpégiateur** : Up, Down, Up/Down, Random, Played, 1–4 octaves, Hold, Gate, rythmes 1/4 → 1/32 (+ triolets), synchronisé au tempo de Cubase
+- 21 presets : cuivres, cordes, nappes, basses, leads, cloches, arpèges, piano, orgue, effets
+
+## Obtenir le fichier .vst3 (sans rien installer : GitHub Actions)
+1. Créez un dépôt GitHub (gratuit) et envoyez-y tout ce dossier (y compris `.github`).
+2. Onglet **Actions** → « Build VST3 (Windows) » → attendez ~10 min.
+3. Téléchargez l'artefact **Jovian8-VST3-Windows-x64** et décompressez-le.
+
+## Ou compiler sur votre PC
+Prérequis : Visual Studio 2022 (charge de travail « Développement Desktop en C++ »), CMake, Git.
+```
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release --target Jovian8_VST3
+```
+Résultat : `build\Jovian8_artefacts\Release\VST3\Jovian8.vst3`
+
+## Installation dans Cubase 9.5
+1. Copiez le dossier `Jovian8.vst3` dans `C:\Program Files\Common Files\VST3\` (droits administrateur).
+2. Lancez Cubase → Studio → Configuration des plug-ins VST → Rescanner. Pensez à utiliser la version **64 bits** de Cubase.
+3. Ajoutez une piste **Instrument** → Jovian8. L'arpégiateur s'active avec la case « Arp On » (presets « Arp … »).
+
+## macOS (Mac mini M1) + GarageBand
+GarageBand ne lit que le format **Audio Unit (AU)**. Le même workflow GitHub Actions construit aussi, sur un Mac Apple Silicon, un binaire universel (M1 + Intel) en AU et VST3.
+1. Lancez le workflow, téléchargez l'artefact **Jovian8-macOS-AU-VST3**, décompressez `Jovian8-AU-macOS.zip`.
+2. Retirez la quarantaine (plug-in non notarisé) : dans le Terminal, `xattr -dr com.apple.quarantine ~/Downloads/Jovian8.component`
+3. Copiez `Jovian8.component` dans `~/Bibliothèque/Audio/Plug-Ins/Components/` (dossier Bibliothèque de votre session ; il faut l'afficher via Aller > Maintenir Option).
+4. Quittez puis relancez GarageBand (il valide le plug-in au démarrage). Piste « Instrument logiciel » → réglages de la piste → Plug-ins → Instrument → **Audio Units → KoalaAudio → Jovian8**.
+5. En cas de refus : `auval -v aumu Jov8 Koal` dans le Terminal donne la cause.
+
+## Structure
+- `Source/Params.h` : table unique des paramètres
+- `Source/Engine.h` : moteur audio (C++ pur) · `Source/Arp.h` : arpégiateur · `Source/Presets.h` : presets
+- `Source/PluginProcessor.*`, `Source/PluginEditor.*` : plug-in JUCE et interface
+- `tests/render_test.cpp` : test hors-ligne (`g++ -std=c++17 -O2 tests/render_test.cpp`)
+
+## Remarques
+- Nom et son originaux : ce n'est ni un clone ni une copie des sons d'usine d'un produit existant ; les presets en recréent le *caractère*.
+- JUCE est sous licence AGPLv3 / commerciale : usage personnel libre ; pour vendre le plug-in, il faut une licence JUCE ou publier le code source.
+
+## Sampler16 (second plug-in du projet)
+Sampler 16 pads, séquenceur de pas (8 patterns), pour vos propres sons — aucun son n'est fourni.
+- Chargement : glisser-déposer un fichier (WAV, AIFF, MP3, FLAC, OGG) sur un pad ou sur la forme d'onde, ou bouton « Charger un son... »
+- Par pad : volume, pan, hauteur, début/fin (poignées sur la forme d'onde), mode One-shot / Gate / Boucle, reverse, attack, release, filtre, résonance, choke (groupes)
+- Mode clavier : le pad sélectionné se joue sur tout le clavier (note racine réglable)
+- Séquenceur : 16 pas, longueur, 4 vitesses, swing, gate ; « Suit lecture » = suit le transport de l'hôte ; « Seq libre » = tourne seul
+- Effets : drive, delay ping-pong, reverb
+- MIDI : pads sur les notes 36 à 51 (C1 à D#2)
+- Les chemins de vos fichiers sont enregistrés dans le projet : ne les déplacez pas après coup.
+Artefacts : `Sampler16.component` (AU, GarageBand) et `Sampler16.vst3` (Cubase).
+
+#pragma once
+// Arpégiateur synchronisé au tempo de l'hôte (C++ pur).
+#include "Engine.h"
+
+namespace jv
+{
+struct ArpSettings
+{
+    int mode = 0;      // 0 Up, 1 Down, 2 Up/Down, 3 Random, 4 Played
+    int rate = 3;      // 0 1/4, 1 1/8, 2 1/8T, 3 1/16, 4 1/16T, 5 1/32
+    int octaves = 1;
+    float gate = 0.5f;
+    bool hold = false;
+};
+
+class Arpeggiator
+{
+public:
+    Arpeggiator()
+    {
+        notes_.reserve (128);
+        base_.reserve (128);
+        seq_.reserve (128 * 4 + 8);
+    }
+
+    void prepare (double sampleRate) { sr_ = sampleRate; reset(); }
+
+    void reset()
+    {
+        notes_.clear();
+        counter_ = 0;
+        sounding_ = -1;
+        gateLeft_ = 0.0;
+        nextStep_ = 0.0;
+        holdWas_ = false;
+    }
+
+    // Consomme les événements de notes de `in` (triés par position) et produit les notes arpégées dans `out`.
+    void process (const std::vector<Ev>& in, std::vector<Ev>& out, int n, const ArpSettings& s,
+                  double bpm, bool hostPlaying, double ppq)
+    {
+        static const double beats[6] = { 1.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125 };
+        bpm = std::min (400.0, std::max (20.0, bpm));
+        const double spb = sr_ * 60.0 / bpm;
+        const double stepBeats = beats[std::min (5, std::max (0, s.rate))];
+        const double stepSamples = std::max (1.0, spb * stepBeats);
+
+        if (holdWas_ && ! s.hold)
+            notes_.erase (std::remove_if (notes_.begin(), notes_.end(), [] (const NoteInfo& x) { return ! x.down; }), notes_.end());
+        holdWas_ = s.hold;
+
+        size_t e = 0;
+        for (int t = 0; t < n; ++t)
+        {
+            while (e < in.size() && in[e].pos <= t)
+            {
+                const Ev& ev = in[e++];
+                if (ev.type == EV_NOTE_ON)
+                {
+                    bool anyDown = false;
+                    for (auto& x : notes_) anyDown = anyDown || x.down;
+                    if (s.hold && ! anyDown) notes_.clear();
+                    const bool wasEmpty = notes_.empty();
+                    bool found = false;
+                    for (auto& x : notes_) if (x.note == ev.note) { x.down = true; x.vel = ev.value; found = true; }
+                    if (! found) notes_.push_back ({ ev.note, ev.value, true });
+                    if (wasEmpty)
+                    {
+                        counter_ = 0;
+                        nextStep_ = 0.0;
+                        if (hostPlaying && ppq >= 0.0)
+                        {
+                            const double pos = (ppq + t / spb) / stepBeats;
+                            const double frac = pos - std::floor (pos);
+                            nextStep_ = frac < 1e-3 ? 0.0 : (1.0 - frac) * stepSamples;
+                        }
+                    }
+                }
+                else if (ev.type == EV_NOTE_OFF)
+                {
+                    for (auto& x : notes_) if (x.note == ev.note) x.down = false;
+                    if (! s.hold)
+                        notes_.erase (std::remove_if (notes_.begin(), notes_.end(), [] (const NoteInfo& x) { return ! x.down; }), notes_.end());
+                }
+                else if (ev.type == EV_ALL_OFF)
+                    notes_.clear();
+
+                if (notes_.empty() && sounding_ >= 0)
+                {
+                    out.push_back ({ t, EV_NOTE_OFF, sounding_, 0.f });
+                    sounding_ = -1;
+                }
+            }
+
+            if (sounding_ >= 0)
+            {
+                if (gateLeft_ <= 0.0) { out.push_back ({ t, EV_NOTE_OFF, sounding_, 0.f }); sounding_ = -1; }
+                else gateLeft_ -= 1.0;
+            }
+
+            if (! notes_.empty())
+            {
+                if (nextStep_ <= 0.0)
+                {
+                    fire (t, out, s, stepSamples);
+                    nextStep_ += stepSamples;
+                }
+                nextStep_ -= 1.0;
+            }
+        }
+    }
+
+private:
+    struct NoteInfo { int note; float vel; bool down; };
+    struct SeqItem { int note; float vel; };
+
+    uint32_t rnd()
+    {
+        rng_ ^= rng_ << 13; rng_ ^= rng_ >> 17; rng_ ^= rng_ << 5;
+        return rng_;
+    }
+
+    void fire (int t, std::vector<Ev>& out, const ArpSettings& s, double stepSamples)
+    {
+        base_.clear();
+        for (auto& x : notes_) base_.push_back ({ x.note, x.vel });
+        if (s.mode != 4)
+            std::sort (base_.begin(), base_.end(), [] (const SeqItem& a, const SeqItem& b) { return a.note < b.note; });
+
+        seq_.clear();
+        const int oct = std::min (4, std::max (1, s.octaves));
+        for (int o = 0; o < oct; ++o)
+            for (auto& b : base_)
+                if (b.note + 12 * o <= 127) seq_.push_back ({ b.note + 12 * o, b.vel });
+        if (seq_.empty()) return;
+
+        if (s.mode == 1)
+            std::reverse (seq_.begin(), seq_.end());
+        else if (s.mode == 2 && seq_.size() > 2)
+        {
+            const size_t sz = seq_.size();
+            for (size_t i = sz - 2; i >= 1; --i) { seq_.push_back (seq_[i]); if (i == 1) break; }
+        }
+
+        size_t idx;
+        if (s.mode == 3) idx = rnd() % seq_.size();
+        else idx = (size_t) (counter_++) % seq_.size();
+
+        const SeqItem pick = seq_[idx];
+        if (sounding_ >= 0) out.push_back ({ t, EV_NOTE_OFF, sounding_, 0.f });
+        out.push_back ({ t, EV_NOTE_ON, pick.note, pick.vel });
+        sounding_ = pick.note;
+        gateLeft_ = std::max (1.0, (double) std::min (0.98f, std::max (0.05f, s.gate)) * stepSamples);
+    }
+
+    double sr_ = 44100.0, nextStep_ = 0.0, gateLeft_ = 0.0;
+    int sounding_ = -1;
+    uint64_t counter_ = 0;
+    bool holdWas_ = false;
+    uint32_t rng_ = 88172645u;
+    std::vector<NoteInfo> notes_;
+    std::vector<SeqItem> base_, seq_;
+};
+} // namespace jv
+
+#pragma once
+// Moteur de synthèse polyphonique 8 voix (C++ pur, sans JUCE).
+// 2 VCO (PolyBLEP) + sync + cross-mod, bruit, HPF, VCF 12 dB (SVF) / 24 dB (échelle),
+// 2 enveloppes ADSR, LFO, modes Poly / Unison / Mono, glide, pédale de sustain.
+#include "Params.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace jv
+{
+constexpr float kPi = 3.14159265358979323846f;
+constexpr int kVoices = 8;
+
+enum EvType { EV_NOTE_ON, EV_NOTE_OFF, EV_ALL_OFF, EV_BEND, EV_MOD, EV_SUSTAIN };
+struct Ev
+{
+    int pos;
+    EvType type;
+    int note;
+    float value;
+};
+
+struct EnvSet { float a, d, s, r; };
+
+struct Envelope
+{
+    enum Stage { Idle, Att, Dec, Sus, Rel };
+    Stage st = Idle;
+    float v = 0.f;
+
+    float tick (const EnvSet& e, float sr)
+    {
+        switch (st)
+        {
+            case Att:
+                v += 1.f / (std::max (e.a, 0.0005f) * sr);
+                if (v >= 1.f) { v = 1.f; st = Dec; }
+                break;
+            case Dec:
+            {
+                const float c = std::exp (-4.6f / (std::max (e.d, 0.001f) * sr));
+                v = e.s + (v - e.s) * c;
+                if (std::fabs (v - e.s) < 1e-4f) { v = e.s; st = Sus; }
+                break;
+            }
+            case Sus: v = e.s; break;
+            case Rel:
+                v *= std::exp (-4.6f / (std::max (e.r, 0.001f) * sr));
+                if (v < 1e-4f) { v = 0.f; st = Idle; }
+                break;
+            default: break;
+        }
+        return v;
+    }
+};
+
+struct Osc
+{
+    float phase = 0.f;
+    bool wrapped = false;
+
+    static float blep (float t, float dt)
+    {
+        if (t < dt) { t /= dt; return t + t - t * t - 1.f; }
+        if (t > 1.f - dt) { t = (t - 1.f) / dt; return t * t + t + t + 1.f; }
+        return 0.f;
+    }
+
+    // wave : 0 tri, 1 saw, 2 pulse (largeur pw), 3 carré
+    float gen (int wave, float dt, float pw)
+    {
+        float out;
+        if (wave == 0)
+            out = 4.f * std::fabs (phase - 0.5f) - 1.f;
+        else if (wave == 1)
+            out = 2.f * phase - 1.f - blep (phase, dt);
+        else
+        {
+            const float w = (wave == 3) ? 0.5f : pw;
+            out = phase < w ? 1.f : -1.f;
+            out += blep (phase, dt);
+            float t2 = phase - w;
+            if (t2 < 0.f) t2 += 1.f;
+            out -= blep (t2, dt);
+            out -= (2.f * w - 1.f); // retire la composante continue
+        }
+        phase += dt;
+        wrapped = false;
+        if (phase >= 1.f) { phase -= 1.f; wrapped = true; }
+        return out;
+    }
+};
+
+struct Svf
+{
+    float s1 = 0.f, s2 = 0.f;
+    void reset() { s1 = s2 = 0.f; }
+    float lp (float x, float g, float R)
+    {
+        const float hp = (x - (2.f * R + g) * s1 - s2) / (1.f + 2.f * R * g + g * g);
+        const float bp = g * hp + s1;
+        s1 = g * hp + bp;
+        const float l = g * bp + s2;
+        s2 = g * bp + l;
+        return l;
+    }
+};
+
+struct Ladder
+{
+    float z[4] = { 0, 0, 0, 0 };
+    void reset() { z[0] = z[1] = z[2] = z[3] = 0.f; }
+    float process (float x, float g, float k)
+    {
+        const float G = g / (1.f + g), G2 = G * G, G3 = G2 * G, G4 = G2 * G2, ig = 1.f / (1.f + g);
+        const float S = (G3 * z[0] + G2 * z[1] + G * z[2] + z[3]) * ig;
+        float y = (x - k * S) / (1.f + k * G4);
+        for (int i = 0; i < 4; ++i)
+        {
+            const float v = (y - z[i]) * G;
+            const float o = v + z[i];
+            z[i] = o + v;
+            y = o;
+        }
+        return y;
+    }
+};
+
+class Engine
+{
+public:
+    void prepare (double sampleRate, int maxBlock = 1024)
+    {
+        sr = (float) sampleRate;
+        lfoBuf.assign ((size_t) std::max (16, maxBlock), 0.f);
+        held.reserve (256);
+        reset();
+    }
+
+    void reset()
+    {
+        for (auto& v : voices) v = Voice();
+        held.clear();
+        sustainDown = false;
+        lastPitch = -1.f;
+        lfoPhase = 0.f;
+        bend = 0.f;
+        modWheel = 0.f;
+        ageCounter = 0;
+    }
+
+    void setParams (const Params& p) { P = p; }
+
+    void handle (const Ev& e)
+    {
+        switch (e.type)
+        {
+            case EV_NOTE_ON:  noteOn (e.note, e.value); break;
+            case EV_NOTE_OFF: noteOff (e.note); break;
+            case EV_ALL_OFF:  allNotesOff(); break;
+            case EV_BEND:     bend = e.value; break;
+            case EV_MOD:      modWheel = e.value; break;
+            case EV_SUSTAIN:  setSustain (e.value > 0.5f); break;
+        }
+    }
+
+    void allNotesOff()
+    {
+        held.clear();
+        for (auto& v : voices)
+            if (v.gateOn) release (v);
+    }
+
+    void render (float* L, float* R, int n)
+    {
+        while (n > 0)
+        {
+            const int m = std::min (n, (int) lfoBuf.size());
+            renderChunk (L, R, m);
+            L += m; R += m; n -= m;
+        }
+    }
+
+private:
+    struct Voice
+    {
+        bool active = false, gateOn = false, pendingRelease = false;
+        int note = 60;
+        float vel = 1.f, pitch = 60.f, target = 60.f, detune = 0.f, lfoGain = 1.f, o2prev = 0.f, hpS = 0.f;
+        uint32_t age = 0;
+        Osc o1, o2;
+        Envelope fe, ae;
+        Ladder lad;
+        Svf svf;
+    };
+
+    float rnd() // [0,1)
+    {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (float) (rng & 0xFFFFFF) / 16777216.f;
+    }
+
+    void release (Voice& v)
+    {
+        v.gateOn = false;
+        v.pendingRelease = false;
+        if (v.fe.st != Envelope::Idle) v.fe.st = Envelope::Rel;
+        if (v.ae.st != Envelope::Idle) v.ae.st = Envelope::Rel;
+    }
+
+    void trigger (Voice& v, int note, float vel, float detune)
+    {
+        const bool fresh = ! v.active || v.ae.st == Envelope::Idle;
+        if (fresh)
+        {
+            v.lad.reset(); v.svf.reset(); v.hpS = 0.f; v.o2prev = 0.f;
+            v.fe.v = 0.f; v.ae.v = 0.f;
+            v.pitch = (P[P_GLIDE] > 0.001f && lastPitch >= 0.f) ? lastPitch : (float) note;
+        }
+        v.note = note; v.vel = vel; v.target = (float) note; v.detune = detune;
+        v.gateOn = true; v.pendingRelease = false; v.active = true; v.age = ++ageCounter;
+        v.fe.st = Envelope::Att; v.ae.st = Envelope::Att;
+        v.lfoGain = P[P_LFODELAY] > 0.001f ? 0.f : 1.f;
+    }
+
+    void triggerMono (int note, float vel)
+    {
+        if ((int) P[P_POLY] == 2)
+        {
+            trigger (voices[0], note, vel, 0.f);
+            for (int i = 1; i < kVoices; ++i)
+                if (voices[i].gateOn) release (voices[i]);
+        }
+        else
+        {
+            for (int i = 0; i < kVoices; ++i)
+                trigger (voices[i], note, vel, ((i - 3.5f) / 3.5f) * P[P_UNIDET] * 40.f);
+        }
+        lastPitch = (float) note;
+    }
+
+    void noteOn (int n, float vel)
+    {
+        if ((int) P[P_POLY] == 0)
+        {
+            Voice* tgt = nullptr;
+            for (auto& v : voices) if (v.active && v.gateOn && v.note == n) { tgt = &v; break; }
+            if (! tgt) for (auto& v : voices) if (! v.active) { tgt = &v; break; }
+            if (! tgt)
+            {
+                uint32_t best = UINT32_MAX;
+                for (auto& v : voices) if (! v.gateOn && v.age < best) { best = v.age; tgt = &v; }
+                if (! tgt)
+                    for (auto& v : voices) if (v.age < best) { best = v.age; tgt = &v; }
+            }
+            trigger (*tgt, n, vel, 0.f);
+            lastPitch = (float) n;
+        }
+        else
+        {
+            held.erase (std::remove_if (held.begin(), held.end(), [n] (const std::pair<int, float>& h) { return h.first == n; }), held.end());
+            held.push_back ({ n, vel });
+            triggerMono (n, vel);
+        }
+    }
+
+    void noteOff (int n)
+    {
+        if ((int) P[P_POLY] == 0)
+        {
+            for (auto& v : voices)
+                if (v.active && v.gateOn && v.note == n)
+                {
+                    if (sustainDown) v.pendingRelease = true; else release (v);
+                }
+        }
+        else
+        {
+            held.erase (std::remove_if (held.begin(), held.end(), [n] (const std::pair<int, float>& h) { return h.first == n; }), held.end());
+            if (held.empty())
+            {
+                for (auto& v : voices)
+                    if (v.gateOn) { if (sustainDown) v.pendingRelease = true; else release (v); }
+            }
+            else
+                triggerMono (held.back().first, held.back().second);
+        }
+    }
+
+    void setSustain (bool d)
+    {
+        sustainDown = d;
+        if (! d)
+            for (auto& v : voices)
+                if (v.pendingRelease) release (v);
+    }
+
+    void renderChunk (float* L, float* R, int m)
+    {
+        // --- LFO global
+        const float lfoInc = P[P_LFORATE] / sr;
+        const int lw = (int) P[P_LFOWAVE];
+        for (int i = 0; i < m; ++i)
+        {
+            lfoPhase += lfoInc;
+            if (lfoPhase >= 1.f) { lfoPhase -= 1.f; shValue = rnd() * 2.f - 1.f; }
+            float x;
+            switch (lw)
+            {
+                case 0: x = 1.f - 4.f * std::fabs (lfoPhase - 0.5f); break;
+                case 1: x = 1.f - 2.f * lfoPhase; break;
+                case 2: x = lfoPhase < 0.5f ? 1.f : -1.f; break;
+                default: x = shValue; break;
+            }
+            lfoBuf[(size_t) i] = x;
+        }
+        std::fill (L, L + m, 0.f);
+        std::fill (R, R + m, 0.f);
+
+        // --- paramètres constants sur le bloc
+        const float glideT = P[P_GLIDE];
+        const float glideCoef = glideT > 0.001f ? 1.f - std::exp (-1.f / (glideT * sr)) : 1.f;
+        const float lfoDelay = P[P_LFODELAY];
+        const float lfoGainInc = lfoDelay > 0.001f ? 1.f / (lfoDelay * sr) : 1.f;
+        const float pd = std::min (1.f, std::max (0.f, P[P_LFOPITCH] + modWheel));
+        const float pitchDepth = pd * pd * 4.f;
+        const float bendSemis = bend * P[P_BENDRANGE];
+        const EnvSet fenv { P[P_FA], P[P_FD], P[P_FS], P[P_FR] };
+        const EnvSet aenv { P[P_AA], P[P_AD], P[P_AS], P[P_AR] };
+        const int w1 = (int) P[P_O1WAVE], w2 = (int) P[P_O2WAVE];
+        const float oct1 = (P[P_O1RANGE] - 1.f) * 12.f;
+        const float oct2 = (P[P_O2RANGE] - 1.f) * 12.f + P[P_O2SEMI] + P[P_O2FINE] / 100.f;
+        const bool sync = P[P_SYNC] > 0.5f;
+        const float xmod = P[P_XMOD], pw = P[P_PW], pwm = P[P_PWM], mix = P[P_MIX], noiseLvl = P[P_NOISE];
+        const float hg = std::tan (kPi * std::min (P[P_HPF], 0.45f * sr) / sr);
+        const float hpG = hg / (1.f + hg);
+        const float cutoff = P[P_CUTOFF], res = P[P_RES];
+        const bool slope24 = (int) P[P_SLOPE] == 1;
+        const float kRes = std::min (res, 0.98f) * 4.f;
+        const float svfR = 1.f - 0.97f * res;
+        const float envAmt = P[P_ENVAMT], keyFol = P[P_KEYFOL], lfoFilt = P[P_LFOFILT];
+        const float velSens = P[P_VELSENS];
+        const float voiceGain = (int) P[P_POLY] == 1 ? 0.30f : 0.42f;
+        const float spread = P[P_SPREAD];
+
+        for (int vi = 0; vi < kVoices; ++vi)
+        {
+            Voice& v = voices[(size_t) vi];
+            if (! v.active) continue;
+
+            const float panPos = 0.5f + 0.5f * spread * (((vi * 5) % 8) / 3.5f - 1.f);
+            const float gl = std::cos (panPos * kPi * 0.5f) * 1.41421f;
+            const float gr = std::sin (panPos * kPi * 0.5f) * 1.41421f;
+            const float velGain = (1.f - velSens) + velSens * v.vel;
+            const float detSemis = v.detune / 100.f;
+
+            for (int i = 0; i < m; ++i)
+            {
+                v.pitch += (v.target - v.pitch) * glideCoef;
+                v.lfoGain = std::min (1.f, v.lfoGain + lfoGainInc);
+                const float lfo = lfoBuf[(size_t) i] * v.lfoGain;
+                const float semis = v.pitch + detSemis + bendSemis + lfo * pitchDepth;
+
+                const float dt1 = std::min (0.45f, 440.f * std::exp2 ((semis + oct1 - 69.f) / 12.f) / sr);
+                const float dt2 = std::min (0.45f, 440.f * std::exp2 ((semis + oct2 - 69.f) / 12.f) / sr);
+                const float pwE = std::min (0.95f, std::max (0.05f, pw + pwm * lfo * 0.45f));
+                const float dt1m = xmod > 0.f ? std::min (0.45f, dt1 * std::exp2 (xmod * v.o2prev * 2.f)) : dt1;
+
+                const float s1 = v.o1.gen (w1, dt1m, pwE);
+                if (sync && v.o1.wrapped) v.o2.phase = std::min (0.999f, v.o1.phase * (dt2 / dt1m));
+                const float s2 = v.o2.gen (w2, dt2, pwE);
+                v.o2prev = s2;
+
+                float sig = (s1 * (1.f - mix) + s2 * mix) * 1.4f;
+                if (noiseLvl > 0.f) sig += (rnd() * 2.f - 1.f) * noiseLvl * 0.8f;
+
+                // HPF 6 dB
+                {
+                    const float vv = (sig - v.hpS) * hpG;
+                    const float lp = vv + v.hpS;
+                    v.hpS = lp + vv;
+                    sig -= lp;
+                }
+
+                const float fe = v.fe.tick (fenv, sr);
+                const float ae = v.ae.tick (aenv, sr);
+
+                float octs = envAmt * 6.f * fe + lfoFilt * lfo * 2.f + keyFol * (v.pitch - 60.f) / 12.f;
+                octs = std::min (8.f, std::max (-8.f, octs));
+                float fc = std::min (cutoff * std::exp2 (octs), 0.45f * sr);
+                fc = std::max (fc, 20.f);
+                const float g = std::tan (kPi * fc / sr);
+                const float y = slope24 ? v.lad.process (sig, g, kRes) * (1.f + 0.5f * res)
+                                        : v.svf.lp (sig, g, svfR);
+
+                const float out = y * ae * velGain * voiceGain;
+                L[i] += out * gl;
+                R[i] += out * gr;
+
+                if (! v.gateOn && v.ae.st == Envelope::Idle) { v.active = false; break; }
+            }
+        }
+
+        const float master = P[P_MASTER];
+        for (int i = 0; i < m; ++i)
+        {
+            L[i] = std::tanh (L[i]) * master;
+            R[i] = std::tanh (R[i]) * master;
+        }
+    }
+
+    Params P = Params::defaults();
+    float sr = 44100.f;
+    Voice voices[kVoices];
+    std::vector<std::pair<int, float>> held;
+    std::vector<float> lfoBuf;
+    bool sustainDown = false;
+    float lastPitch = -1.f, lfoPhase = 0.f, shValue = 0.f, bend = 0.f, modWheel = 0.f;
+    uint32_t ageCounter = 0, rng = 2463534242u;
+};
+} // namespace jv
+
+#pragma once
+// Table unique des paramètres (C++ pur, sans JUCE) : sert au moteur, aux presets,
+// à la déclaration des paramètres VST3 et à l'interface.
+#include <array>
+
+namespace jv
+{
+enum Kind { K_FLOAT, K_CHOICE, K_BOOL, K_INT };
+
+struct ParamDef
+{
+    const char* id;
+    const char* name;
+    float mn, mx, def, skew;
+    Kind kind;
+    const char* choices; // séparés par '|'
+};
+
+//        enum      id            nom              min    max    def    skew  type      choix
+#define JV_PARAMS(X)                                                                                         \
+    X(MASTER,   "master",     "Master",        0.f,   1.f,   0.7f,  1.f,  K_FLOAT,  "")                      \
+    X(POLY,     "polyMode",   "Mode",          0.f,   2.f,   0.f,   1.f,  K_CHOICE, "Poly|Unison|Mono")      \
+    X(GLIDE,    "glide",      "Glide",         0.f,   5.f,   0.f,   0.4f, K_FLOAT,  "")                      \
+    X(UNIDET,   "uniDetune",  "Unison Det.",   0.f,   1.f,   0.3f,  1.f,  K_FLOAT,  "")                      \
+    X(SPREAD,   "spread",     "Stereo",        0.f,   1.f,   0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(BENDRANGE,"bendRange",  "Bend",          1.f,   12.f,  2.f,   1.f,  K_INT,    "")                      \
+    X(VELSENS,  "velSens",    "Velocity",      0.f,   1.f,   0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(CHORUS,   "chorus",     "Chorus",        0.f,   2.f,   0.f,   1.f,  K_CHOICE, "Off|I|II")              \
+    X(O1WAVE,   "osc1Wave",   "Onde",          0.f,   3.f,   1.f,   1.f,  K_CHOICE, "Tri|Saw|Pulse|Square")  \
+    X(O1RANGE,  "osc1Range",  "Pied",          0.f,   3.f,   1.f,   1.f,  K_CHOICE, "16'|8'|4'|2'")          \
+    X(O2WAVE,   "osc2Wave",   "Onde",          0.f,   3.f,   1.f,   1.f,  K_CHOICE, "Tri|Saw|Pulse|Square")  \
+    X(O2RANGE,  "osc2Range",  "Pied",          0.f,   3.f,   1.f,   1.f,  K_CHOICE, "16'|8'|4'|2'")          \
+    X(O2SEMI,   "osc2Semi",   "Semi",          -12.f, 12.f,  0.f,   1.f,  K_INT,    "")                      \
+    X(O2FINE,   "osc2Fine",   "Fine",          -100.f,100.f, 0.f,   1.f,  K_FLOAT,  "")                      \
+    X(SYNC,     "sync",       "Sync",          0.f,   1.f,   0.f,   1.f,  K_BOOL,   "")                      \
+    X(XMOD,     "xmod",       "X-Mod",         0.f,   1.f,   0.f,   1.f,  K_FLOAT,  "")                      \
+    X(PW,       "pw",         "PW",            0.05f, 0.95f, 0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(PWM,      "pwm",        "PWM LFO",       0.f,   1.f,   0.f,   1.f,  K_FLOAT,  "")                      \
+    X(MIX,      "mix",        "Osc 2 Mix",     0.f,   1.f,   0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(NOISE,    "noise",      "Noise",         0.f,   1.f,   0.f,   1.f,  K_FLOAT,  "")                      \
+    X(HPF,      "hpf",        "HPF",           20.f,  2000.f,20.f,  0.4f, K_FLOAT,  "")                      \
+    X(CUTOFF,   "cutoff",     "Cutoff",        20.f,  18000.f,8000.f,0.3f,K_FLOAT,  "")                      \
+    X(RES,      "res",        "Resonance",     0.f,   1.f,   0.1f,  1.f,  K_FLOAT,  "")                      \
+    X(SLOPE,    "slope",      "Pente",         0.f,   1.f,   1.f,   1.f,  K_CHOICE, "12 dB|24 dB")           \
+    X(ENVAMT,   "envAmt",     "Env Amt",       -1.f,  1.f,   0.3f,  1.f,  K_FLOAT,  "")                      \
+    X(KEYFOL,   "keyFollow",  "Key Follow",    0.f,   1.f,   0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(LFOFILT,  "lfoFilt",    "LFO > VCF",     0.f,   1.f,   0.f,   1.f,  K_FLOAT,  "")                      \
+    X(FA,       "fenvA",      "Attack",        0.001f,10.f,  0.01f, 0.35f,K_FLOAT,  "")                      \
+    X(FD,       "fenvD",      "Decay",         0.005f,10.f,  0.5f,  0.35f,K_FLOAT,  "")                      \
+    X(FS,       "fenvS",      "Sustain",       0.f,   1.f,   0.5f,  1.f,  K_FLOAT,  "")                      \
+    X(FR,       "fenvR",      "Release",       0.005f,10.f,  0.3f,  0.35f,K_FLOAT,  "")                      \
+    X(AA,       "aenvA",      "Attack",        0.001f,10.f,  0.005f,0.35f,K_FLOAT,  "")                      \
+    X(AD,       "aenvD",      "Decay",         0.005f,10.f,  0.3f,  0.35f,K_FLOAT,  "")                      \
+    X(AS,       "aenvS",      "Sustain",       0.f,   1.f,   0.8f,  1.f,  K_FLOAT,  "")                      \
+    X(AR,       "aenvR",      "Release",       0.005f,10.f,  0.3f,  0.35f,K_FLOAT,  "")                      \
+    X(LFOWAVE,  "lfoWave",    "Onde",          0.f,   3.f,   0.f,   1.f,  K_CHOICE, "Tri|Saw|Square|S&H")    \
+    X(LFORATE,  "lfoRate",    "Rate",          0.05f, 30.f,  5.f,   0.4f, K_FLOAT,  "")                      \
+    X(LFODELAY, "lfoDelay",   "Delay",         0.f,   4.f,   0.f,   0.5f, K_FLOAT,  "")                      \
+    X(LFOPITCH, "lfoPitch",   "LFO > Pitch",   0.f,   1.f,   0.f,   1.f,  K_FLOAT,  "")                      \
+    X(ARPON,    "arpOn",      "Arp On",        0.f,   1.f,   0.f,   1.f,  K_BOOL,   "")                      \
+    X(ARPHOLD,  "arpHold",    "Hold",          0.f,   1.f,   0.f,   1.f,  K_BOOL,   "")                      \
+    X(ARPMODE,  "arpMode",    "Mode",          0.f,   4.f,   0.f,   1.f,  K_CHOICE, "Up|Down|Up/Down|Random|Played") \
+    X(ARPRATE,  "arpRate",    "Rate",          0.f,   5.f,   3.f,   1.f,  K_CHOICE, "1/4|1/8|1/8T|1/16|1/16T|1/32") \
+    X(ARPOCT,   "arpOct",     "Octaves",       1.f,   4.f,   1.f,   1.f,  K_INT,    "")                      \
+    X(ARPGATE,  "arpGate",    "Gate",          0.1f,  0.95f, 0.5f,  1.f,  K_FLOAT,  "")
+
+enum PId
+{
+#define X(n, id, name, mn, mx, def, skew, kind, ch) P_##n,
+    JV_PARAMS(X)
+#undef X
+    P_COUNT
+};
+
+inline const ParamDef kDefs[P_COUNT] = {
+#define X(n, id, name, mn, mx, def, skew, kind, ch) { id, name, mn, mx, def, skew, kind, ch },
+    JV_PARAMS(X)
+#undef X
+};
+
+struct Params
+{
+    float v[P_COUNT];
+    float operator[] (int i) const { return v[i]; }
+    static Params defaults()
+    {
+        Params p;
+        for (int i = 0; i < P_COUNT; ++i) p.v[i] = kDefs[i].def;
+        return p;
+    }
+};
+} // namespace jv
+
+#include "PluginEditor.h"
+
+namespace
+{
+const juce::Colour kBg (0xff15171c), kPanel (0xff1f2229), kAccent (0xffff8a1f), kText (0xffd8dce4), kDim (0xff8b93a1);
+}
+
+JovianLookAndFeel::JovianLookAndFeel()
+{
+    setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff2b2f38));
+    setColour (juce::ComboBox::textColourId, kText);
+    setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff3a3f4b));
+    setColour (juce::ComboBox::arrowColourId, kAccent);
+    setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff23262e));
+    setColour (juce::PopupMenu::textColourId, kText);
+    setColour (juce::PopupMenu::highlightedBackgroundColourId, kAccent);
+    setColour (juce::PopupMenu::highlightedTextColourId, juce::Colours::black);
+    setColour (juce::Slider::textBoxTextColourId, kDim);
+    setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    setColour (juce::Label::textColourId, kText);
+    setColour (juce::ToggleButton::tickColourId, kAccent);
+    setColour (juce::ToggleButton::tickDisabledColourId, kDim);
+    setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2b2f38));
+    setColour (juce::TextButton::textColourOffId, kText);
+}
+
+void JovianLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
+                                          float startAngle, float endAngle, juce::Slider&)
+{
+    const auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) h).reduced (4.f);
+    const float r = std::min (bounds.getWidth(), bounds.getHeight()) * 0.5f;
+    const auto c = bounds.getCentre();
+    const float angle = startAngle + pos * (endAngle - startAngle);
+
+    g.setColour (juce::Colour (0xff2b2f38));
+    g.fillEllipse (c.x - r, c.y - r, 2 * r, 2 * r);
+
+    juce::Path track, value;
+    const float ar = r - 2.f;
+    track.addCentredArc (c.x, c.y, ar, ar, 0.f, startAngle, endAngle, true);
+    value.addCentredArc (c.x, c.y, ar, ar, 0.f, startAngle, angle, true);
+    g.setColour (juce::Colour (0xff3d4350));
+    g.strokePath (track, juce::PathStrokeType (2.5f));
+    g.setColour (kAccent);
+    g.strokePath (value, juce::PathStrokeType (2.5f));
+
+    juce::Path pointer;
+    pointer.addRoundedRectangle (-1.5f, -r + 5.f, 3.f, r * 0.45f, 1.f);
+    g.setColour (kText);
+    g.fillPath (pointer, juce::AffineTransform::rotation (angle).translated (c.x, c.y));
+}
+
+JovianEditor::JovianEditor (JovianProcessor& p) : AudioProcessorEditor (&p), proc (p)
+{
+    setLookAndFeel (&lnf);
+
+    controls.resize (jv::P_COUNT);
+    for (int i = 0; i < jv::P_COUNT; ++i)
+    {
+        const auto& d = jv::kDefs[i];
+        auto c = std::make_unique<Control>();
+        c->id = i;
+        c->label.setText (d.name, juce::dontSendNotification);
+        c->label.setJustificationType (juce::Justification::centred);
+        c->label.setFont (juce::Font (juce::FontOptions (11.0f)));
+        c->label.setColour (juce::Label::textColourId, kDim);
+        addAndMakeVisible (c->label);
+
+        auto* param = p.apvts.getParameter (d.id);
+        switch (d.kind)
+        {
+            case jv::K_FLOAT:
+            case jv::K_INT:
+                c->slider = std::make_unique<juce::Slider> (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow);
+                c->slider->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 62, 14);
+                c->sa = std::make_unique<juce::SliderParameterAttachment> (*param, *c->slider);
+                c->slider->setDoubleClickReturnValue (true, d.def);
+                addAndMakeVisible (*c->slider);
+                break;
+            case jv::K_CHOICE:
+                c->combo = std::make_unique<juce::ComboBox>();
+                c->combo->addItemList (juce::StringArray::fromTokens (d.choices, "|", ""), 1);
+                c->ca = std::make_unique<juce::ComboBoxParameterAttachment> (*param, *c->combo);
+                addAndMakeVisible (*c->combo);
+                break;
+            case jv::K_BOOL:
+                c->toggle = std::make_unique<juce::ToggleButton>();
+                c->ba = std::make_unique<juce::ButtonParameterAttachment> (*param, *c->toggle);
+                addAndMakeVisible (*c->toggle);
+                break;
+        }
+        controls[(size_t) i] = std::move(c);
+    }
+
+    using namespace jv;
+    sections = {
+        { "OSCILLATEUR 1", 0, { P_O1WAVE, P_O1RANGE }, {} },
+        { "OSCILLATEUR 2", 0, { P_O2WAVE, P_O2RANGE, P_O2SEMI, P_O2FINE, P_SYNC }, {} },
+        { "MIXEUR / MOD", 0, { P_MIX, P_NOISE, P_PW, P_PWM, P_XMOD }, {} },
+        { "FILTRE (HPF / VCF)", 1, { P_HPF, P_CUTOFF, P_RES, P_SLOPE, P_ENVAMT, P_KEYFOL, P_LFOFILT }, {} },
+        { "ENV-1 FILTRE", 1, { P_FA, P_FD, P_FS, P_FR }, {} },
+        { "ENV-2 AMPLI", 1, { P_AA, P_AD, P_AS, P_AR }, {} },
+        { "LFO", 2, { P_LFOWAVE, P_LFORATE, P_LFODELAY, P_LFOPITCH }, {} },
+        { "ARPEGIATEUR", 2, { P_ARPON, P_ARPHOLD, P_ARPMODE, P_ARPRATE, P_ARPOCT, P_ARPGATE }, {} },
+        { "GLOBAL", 3, { P_POLY, P_GLIDE, P_UNIDET, P_SPREAD, P_CHORUS, P_BENDRANGE, P_VELSENS, P_MASTER }, {} },
+    };
+
+    // barre de presets
+    for (int i = 0; i < proc.getNumPrograms(); ++i)
+        presetBox.addItem (proc.getProgramName (i), i + 1);
+    presetBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
+    presetBox.onChange = [this] { proc.setCurrentProgram (presetBox.getSelectedItemIndex()); };
+    addAndMakeVisible (presetBox);
+
+    prevBtn.onClick = [this]
+    {
+        const int n = proc.getNumPrograms();
+        presetBox.setSelectedItemIndex ((presetBox.getSelectedItemIndex() + n - 1) % n, juce::sendNotification);
+    };
+    nextBtn.onClick = [this]
+    {
+        const int n = proc.getNumPrograms();
+        presetBox.setSelectedItemIndex ((presetBox.getSelectedItemIndex() + 1) % n, juce::sendNotification);
+    };
+    addAndMakeVisible (prevBtn);
+    addAndMakeVisible (nextBtn);
+
+    setSize (1100, 640);
+}
+
+JovianEditor::~JovianEditor() { setLookAndFeel (nullptr); }
+
+void JovianEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (kBg);
+    g.setColour (kAccent);
+    g.setFont (juce::Font (juce::FontOptions (26.0f, juce::Font::bold)));
+    g.drawText ("JOVIAN 8", 20, 10, 200, 36, juce::Justification::centredLeft);
+    g.setColour (kDim);
+    g.setFont (11.0f);
+    g.drawText ("synthe polyphonique analogique virtuel - 8 voix", 22, 40, 320, 16, juce::Justification::centredLeft);
+
+    for (const auto& s : sections)
+    {
+        g.setColour (kPanel);
+        g.fillRoundedRectangle (s.bounds.toFloat(), 8.f);
+        g.setColour (kAccent.withAlpha (0.8f));
+        g.fillRect (s.bounds.getX() + 10, s.bounds.getY() + 21, 24, 2);
+        g.setColour (kText);
+        g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+        g.drawText (s.title, s.bounds.getX() + 10, s.bounds.getY() + 4, s.bounds.getWidth() - 20, 16, juce::Justification::centredLeft);
+    }
+}
+
+void JovianEditor::resized()
+{
+    auto area = getLocalBounds();
+    auto top = area.removeFromTop (62).reduced (16, 12);
+    nextBtn.setBounds (top.removeFromRight (34));
+    top.removeFromRight (4);
+    prevBtn.setBounds (top.removeFromRight (34));
+    top.removeFromRight (6);
+    presetBox.setBounds (top.removeFromRight (300));
+
+    area.reduce (12, 6);
+    const int rows = 4;
+    const int rowH = area.getHeight() / rows;
+
+    for (int r = 0; r < rows; ++r)
+    {
+        int total = 0;
+        for (auto& s : sections) if (s.row == r) total += (int) s.ids.size();
+        auto rowArea = area.removeFromTop (rowH).reduced (0, 4);
+        for (auto& s : sections)
+        {
+            if (s.row != r) continue;
+            const int w = rowArea.getWidth() * (int) s.ids.size() / std::max (1, total);
+            s.bounds = rowArea.removeFromLeft (w).reduced (4, 0);
+            total -= (int) s.ids.size();
+        }
+    }
+
+    for (auto& s : sections)
+    {
+        auto inner = s.bounds.reduced (6, 0);
+        inner.removeFromTop (28);
+        const int cw = inner.getWidth() / std::max (1, (int) s.ids.size());
+        for (int id : s.ids)
+        {
+            auto cell = inner.removeFromLeft (cw);
+            auto& c = *controls[(size_t) id];
+            c.label.setBounds (cell.removeFromTop (16));
+            if (c.slider)
+                c.slider->setBounds (cell.reduced (2));
+            else if (c.combo)
+                c.combo->setBounds (cell.withSizeKeepingCentre (std::min (cell.getWidth() - 8, 96), 26).translated (0, -8));
+            else if (c.toggle)
+                c.toggle->setBounds (cell.withSizeKeepingCentre (30, 30).translated (0, -6));
+        }
+    }
+}
+
+#pragma once
+#include "PluginProcessor.h"
+
+class JovianLookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    JovianLookAndFeel();
+    void drawRotarySlider (juce::Graphics&, int x, int y, int w, int h, float pos, float startAngle, float endAngle, juce::Slider&) override;
+};
+
+class JovianEditor : public juce::AudioProcessorEditor
+{
+public:
+    explicit JovianEditor (JovianProcessor&);
+    ~JovianEditor() override;
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    struct Control
+    {
+        int id = 0;
+        juce::Label label;
+        std::unique_ptr<juce::Slider> slider;
+        std::unique_ptr<juce::ComboBox> combo;
+        std::unique_ptr<juce::ToggleButton> toggle;
+        // les attachements sont déclarés après les composants : détruits en premier
+        std::unique_ptr<juce::SliderParameterAttachment> sa;
+        std::unique_ptr<juce::ComboBoxParameterAttachment> ca;
+        std::unique_ptr<juce::ButtonParameterAttachment> ba;
+        juce::Component* comp() { return slider ? (juce::Component*) slider.get() : combo ? (juce::Component*) combo.get() : (juce::Component*) toggle.get(); }
+    };
+
+    struct Section
+    {
+        juce::String title;
+        int row;
+        std::vector<int> ids;
+        juce::Rectangle<int> bounds;
+    };
+
+    JovianProcessor& proc;
+    JovianLookAndFeel lnf;
+    std::vector<std::unique_ptr<Control>> controls; // indexé par PId
+    std::vector<Section> sections;
+    juce::ComboBox presetBox;
+    juce::TextButton prevBtn { "<" }, nextBtn { ">" };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JovianEditor)
+};
+
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
+
+JovianProcessor::JovianProcessor()
+    : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "STATE", makeLayout())
+{
+    for (int i = 0; i < jv::P_COUNT; ++i)
+        raw[(size_t) i] = apvts.getRawParameterValue (jv::kDefs[i].id);
+
+    noteEvs.reserve (512);
+    ctrlEvs.reserve (512);
+    arpOut.reserve (1024);
+    merged.reserve (2048);
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout JovianProcessor::makeLayout()
+{
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
+    for (int i = 0; i < jv::P_COUNT; ++i)
+    {
+        const auto& d = jv::kDefs[i];
+        const juce::ParameterID pid { d.id, 1 };
+        switch (d.kind)
+        {
+            case jv::K_FLOAT:
+            {
+                juce::NormalisableRange<float> r (d.mn, d.mx, 0.0f, d.skew);
+                ps.push_back (std::make_unique<juce::AudioParameterFloat> (pid, d.name, r, d.def));
+                break;
+            }
+            case jv::K_CHOICE:
+                ps.push_back (std::make_unique<juce::AudioParameterChoice> (
+                    pid, d.name, juce::StringArray::fromTokens (d.choices, "|", ""), (int) d.def));
+                break;
+            case jv::K_BOOL:
+                ps.push_back (std::make_unique<juce::AudioParameterBool> (pid, d.name, d.def > 0.5f));
+                break;
+            case jv::K_INT:
+                ps.push_back (std::make_unique<juce::AudioParameterInt> (pid, d.name, (int) d.mn, (int) d.mx, (int) d.def));
+                break;
+        }
+    }
+    return { ps.begin(), ps.end() };
+}
+
+void JovianProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    engine.prepare (sampleRate, std::max (samplesPerBlock, 1024));
+    arp.prepare (sampleRate);
+    arpWasOn = false;
+
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) std::max (samplesPerBlock, 1), 2 };
+    chorus.prepare (spec);
+    chorus.reset();
+}
+
+bool JovianProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+}
+
+void JovianProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+{
+    juce::ScopedNoDenormals noDenormals;
+    const int n = buffer.getNumSamples();
+    buffer.clear();
+
+    jv::Params p;
+    for (int i = 0; i < jv::P_COUNT; ++i) p.v[i] = raw[(size_t) i]->load();
+
+    // --- MIDI -> événements internes
+    noteEvs.clear();
+    ctrlEvs.clear();
+    for (const auto meta : midi)
+    {
+        const auto m = meta.getMessage();
+        const int pos = juce::jlimit (0, juce::jmax (0, n - 1), meta.samplePosition);
+        if (m.isNoteOn())
+            noteEvs.push_back ({ pos, jv::EV_NOTE_ON, m.getNoteNumber(), m.getFloatVelocity() });
+        else if (m.isNoteOff())
+            noteEvs.push_back ({ pos, jv::EV_NOTE_OFF, m.getNoteNumber(), 0.f });
+        else if (m.isAllNotesOff() || m.isAllSoundOff())
+            noteEvs.push_back ({ pos, jv::EV_ALL_OFF, 0, 0.f });
+        else if (m.isPitchWheel())
+            ctrlEvs.push_back ({ pos, jv::EV_BEND, 0, (m.getPitchWheelValue() - 8192) / 8192.f });
+        else if (m.isControllerOfType (1))
+            ctrlEvs.push_back ({ pos, jv::EV_MOD, 0, m.getControllerValue() / 127.f });
+        else if (m.isControllerOfType (64))
+            ctrlEvs.push_back ({ pos, jv::EV_SUSTAIN, 0, m.getControllerValue() >= 64 ? 1.f : 0.f });
+    }
+    midi.clear();
+
+    // --- Arpégiateur
+    const bool arpOn = p[jv::P_ARPON] > 0.5f;
+    if (arpOn != arpWasOn)
+    {
+        engine.allNotesOff();
+        arp.reset();
+        arpWasOn = arpOn;
+    }
+
+    const std::vector<jv::Ev>* notes = &noteEvs;
+    if (arpOn)
+    {
+        double bpm = 120.0, ppq = -1.0;
+        bool playing = false;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+            {
+                bpm = pos->getBpm().orFallback (120.0);
+                playing = pos->getIsPlaying();
+                ppq = pos->getPpqPosition().orFallback (-1.0);
+            }
+
+        jv::ArpSettings s;
+        s.mode = (int) p[jv::P_ARPMODE];
+        s.rate = (int) p[jv::P_ARPRATE];
+        s.octaves = (int) p[jv::P_ARPOCT];
+        s.gate = p[jv::P_ARPGATE];
+        s.hold = p[jv::P_ARPHOLD] > 0.5f;
+
+        arpOut.clear();
+        arp.process (noteEvs, arpOut, n, s, bpm, playing, ppq);
+        notes = &arpOut;
+    }
+
+    // --- fusion triée (contrôleurs d'abord à position égale), sans allocation
+    merged.clear();
+    {
+        size_t a = 0, b = 0;
+        while (a < ctrlEvs.size() || b < notes->size())
+        {
+            if (b >= notes->size() || (a < ctrlEvs.size() && ctrlEvs[a].pos <= (*notes)[b].pos))
+                merged.push_back (ctrlEvs[a++]);
+            else
+                merged.push_back ((*notes)[b++]);
+        }
+    }
+
+    // --- rendu
+    engine.setParams (p);
+    float* L = buffer.getWritePointer (0);
+    float* R = buffer.getWritePointer (1);
+    int cur = 0;
+    for (const auto& e : merged)
+    {
+        if (e.pos > cur)
+        {
+            engine.render (L + cur, R + cur, e.pos - cur);
+            cur = e.pos;
+        }
+        engine.handle (e);
+    }
+    if (cur < n) engine.render (L + cur, R + cur, n - cur);
+
+    // --- chorus
+    const int ch = (int) p[jv::P_CHORUS];
+    if (ch > 0)
+    {
+        chorus.setRate (ch == 1 ? 0.5f : 0.8f);
+        chorus.setDepth (ch == 1 ? 0.25f : 0.35f);
+        chorus.setCentreDelay (7.0f);
+        chorus.setFeedback (0.0f);
+        chorus.setMix (0.5f);
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> ctx (block);
+        chorus.process (ctx);
+    }
+}
+
+void JovianProcessor::setParam (int id, float v)
+{
+    if (auto* prm = apvts.getParameter (jv::kDefs[id].id))
+        prm->setValueNotifyingHost (prm->convertTo0to1 (v));
+}
+
+void JovianProcessor::setCurrentProgram (int index)
+{
+    const auto& list = jv::presets();
+    if (index < 0 || index >= (int) list.size()) return;
+    currentProgram = index;
+    for (int i = 0; i < jv::P_COUNT; ++i) setParam (i, jv::kDefs[i].def);
+    for (const auto& kv : list[(size_t) index].v) setParam (kv.first, kv.second);
+}
+
+const juce::String JovianProcessor::getProgramName (int index)
+{
+    const auto& list = jv::presets();
+    return (index >= 0 && index < (int) list.size()) ? juce::String (list[(size_t) index].name) : juce::String();
+}
+
+void JovianProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    auto state = apvts.copyState();
+    state.setProperty ("program", currentProgram, nullptr);
+    if (auto xml = state.createXml()) copyXmlToBinary (*xml, destData);
+}
+
+void JovianProcessor::setStateInformation (const void* data, int size)
+{
+    if (auto xml = getXmlFromBinary (data, size))
+        if (xml->hasTagName (apvts.state.getType()))
+        {
+            auto tree = juce::ValueTree::fromXml (*xml);
+            currentProgram = (int) tree.getProperty ("program", 0);
+            apvts.replaceState (tree);
+        }
+}
+
+juce::AudioProcessorEditor* JovianProcessor::createEditor() { return new JovianEditor (*this); }
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new JovianProcessor(); }
+
+#pragma once
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_dsp/juce_dsp.h>
+#include "Arp.h"
+#include "Engine.h"
+#include "Presets.h"
+
+class JovianProcessor : public juce::AudioProcessor
+{
+public:
+    JovianProcessor();
+    ~JovianProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override {}
+    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return true; }
+
+    const juce::String getName() const override { return "Jovian8"; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 4.0; }
+
+    int getNumPrograms() override { return (int) jv::presets().size(); }
+    int getCurrentProgram() override { return currentProgram; }
+    void setCurrentProgram (int index) override;
+    const juce::String getProgramName (int index) override;
+    void changeProgramName (int, const juce::String&) override {}
+
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
+
+    juce::AudioProcessorValueTreeState apvts;
+
+private:
+    static juce::AudioProcessorValueTreeState::ParameterLayout makeLayout();
+    void setParam (int id, float realValue);
+
+    jv::Engine engine;
+    jv::Arpeggiator arp;
+    juce::dsp::Chorus<float> chorus;
+    std::array<std::atomic<float>*, jv::P_COUNT> raw {};
+    std::vector<jv::Ev> noteEvs, ctrlEvs, arpOut, merged;
+    int currentProgram = 0;
+    bool arpWasOn = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JovianProcessor)
+};
+
+#pragma once
+// Presets inspirés du caractère des sons les plus célèbres des synthés polyphoniques
+// analogiques des années 80 (cuivres, cordes, nappes, basses, leads, arpèges).
+// Ce sont des recréations originales, pas des copies de sons d'usine.
+#include "Params.h"
+#include <utility>
+#include <vector>
+
+namespace jv
+{
+struct PresetDef
+{
+    const char* name;
+    std::vector<std::pair<int, float>> v; // (paramètre, valeur réelle) ; le reste = valeurs par défaut
+};
+
+inline const std::vector<PresetDef>& presets()
+{
+    // Rappel : ondes 0 Tri 1 Saw 2 Pulse 3 Square | pieds 0 16' 1 8' 2 4' 3 2' | pente 0 12 dB 1 24 dB
+    // Arp mode 0 Up 1 Down 2 UpDown 3 Random 4 Played | rate 0 1/4 1 1/8 2 1/8T 3 1/16 4 1/16T 5 1/32
+    static const std::vector<PresetDef> list = {
+        { "Init Saw", {} },
+
+        { "Brass Stab (Jump)",
+          { { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 7 }, { P_MIX, 0.5f }, { P_CUTOFF, 1100 }, { P_RES, 0.12f },
+            { P_ENVAMT, 0.55f }, { P_KEYFOL, 0.6f }, { P_FA, 0.09f }, { P_FD, 0.45f }, { P_FS, 0.4f }, { P_FR, 0.25f },
+            { P_AA, 0.025f }, { P_AD, 0.4f }, { P_AS, 0.85f }, { P_AR, 0.18f }, { P_CHORUS, 1 }, { P_VELSENS, 0.4f } } },
+
+        { "Soft Brass Swell",
+          { { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 5 }, { P_CUTOFF, 800 }, { P_ENVAMT, 0.45f }, { P_FA, 0.22f },
+            { P_FD, 0.6f }, { P_FS, 0.5f }, { P_FR, 0.4f }, { P_AA, 0.12f }, { P_AS, 0.9f }, { P_AR, 0.35f }, { P_CHORUS, 1 },
+            { P_LFOPITCH, 0.08f }, { P_LFORATE, 5.2f }, { P_LFODELAY, 0.8f } } },
+
+        { "Strings Ensemble",
+          { { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 11 }, { P_HPF, 180 }, { P_CUTOFF, 5200 }, { P_RES, 0.05f },
+            { P_ENVAMT, 0.1f }, { P_AA, 0.55f }, { P_AD, 0.5f }, { P_AS, 1.f }, { P_AR, 0.9f }, { P_FA, 0.6f },
+            { P_FS, 1.f }, { P_CHORUS, 2 }, { P_SPREAD, 0.9f }, { P_LFOPITCH, 0.06f }, { P_LFORATE, 5.8f } } },
+
+        { "Warm Pad",
+          { { P_O1WAVE, 1 }, { P_O2WAVE, 2 }, { P_PW, 0.4f }, { P_PWM, 0.35f }, { P_LFORATE, 0.4f }, { P_O2FINE, 6 },
+            { P_CUTOFF, 2400 }, { P_RES, 0.12f }, { P_ENVAMT, 0.2f }, { P_AA, 1.2f }, { P_AD, 1.f }, { P_AS, 1.f },
+            { P_AR, 1.6f }, { P_FA, 1.4f }, { P_FS, 0.9f }, { P_CHORUS, 2 }, { P_SPREAD, 0.9f } } },
+
+        { "PWM Pad",
+          { { P_O1WAVE, 2 }, { P_O2WAVE, 2 }, { P_O2FINE, 8 }, { P_PW, 0.5f }, { P_PWM, 0.7f }, { P_LFORATE, 0.6f },
+            { P_CUTOFF, 3200 }, { P_RES, 0.1f }, { P_ENVAMT, 0.15f }, { P_AA, 0.8f }, { P_AS, 1.f }, { P_AR, 1.2f },
+            { P_FA, 0.9f }, { P_FS, 0.9f }, { P_CHORUS, 2 }, { P_SPREAD, 1.f } } },
+
+        { "Sync Lead",
+          { { P_POLY, 2 }, { P_GLIDE, 0.08f }, { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_SYNC, 1 }, { P_O2SEMI, 7 }, { P_MIX, 0.7f },
+            { P_CUTOFF, 5500 }, { P_RES, 0.2f }, { P_ENVAMT, 0.25f }, { P_FD, 0.8f }, { P_FS, 0.6f }, { P_AA, 0.005f },
+            { P_AS, 0.9f }, { P_AR, 0.2f }, { P_LFOPITCH, 0.15f }, { P_LFORATE, 5.5f }, { P_LFODELAY, 0.6f }, { P_CHORUS, 1 } } },
+
+        { "Fat Unison Lead",
+          { { P_POLY, 1 }, { P_UNIDET, 0.35f }, { P_GLIDE, 0.05f }, { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 4 },
+            { P_CUTOFF, 3500 }, { P_RES, 0.25f }, { P_ENVAMT, 0.3f }, { P_FD, 0.6f }, { P_FS, 0.55f }, { P_AA, 0.01f },
+            { P_AS, 0.9f }, { P_AR, 0.25f }, { P_LFOPITCH, 0.1f }, { P_LFODELAY, 0.7f }, { P_CHORUS, 1 }, { P_SPREAD, 0.8f } } },
+
+        { "Sub Bass",
+          { { P_POLY, 2 }, { P_O1WAVE, 3 }, { P_O1RANGE, 0 }, { P_O2WAVE, 1 }, { P_O2RANGE, 0 }, { P_MIX, 0.4f },
+            { P_CUTOFF, 600 }, { P_RES, 0.3f }, { P_ENVAMT, 0.4f }, { P_KEYFOL, 0.3f }, { P_FA, 0.001f }, { P_FD, 0.25f },
+            { P_FS, 0.2f }, { P_FR, 0.1f }, { P_AA, 0.003f }, { P_AS, 1.f }, { P_AR, 0.1f } } },
+
+        { "Resonant Pluck Bass",
+          { { P_POLY, 2 }, { P_O1WAVE, 1 }, { P_O1RANGE, 0 }, { P_O2WAVE, 2 }, { P_O2RANGE, 1 }, { P_PW, 0.35f },
+            { P_MIX, 0.4f }, { P_CUTOFF, 300 }, { P_RES, 0.5f }, { P_ENVAMT, 0.75f }, { P_KEYFOL, 0.4f }, { P_FA, 0.001f },
+            { P_FD, 0.18f }, { P_FS, 0.f }, { P_FR, 0.12f }, { P_AA, 0.002f }, { P_AD, 0.35f }, { P_AS, 0.7f }, { P_AR, 0.1f } } },
+
+        { "Poly Pluck",
+          { { P_O1WAVE, 1 }, { P_O2WAVE, 2 }, { P_O2FINE, 5 }, { P_CUTOFF, 900 }, { P_RES, 0.2f }, { P_ENVAMT, 0.6f },
+            { P_FA, 0.001f }, { P_FD, 0.25f }, { P_FS, 0.f }, { P_FR, 0.2f }, { P_AA, 0.002f }, { P_AD, 0.4f },
+            { P_AS, 0.f }, { P_AR, 0.3f }, { P_CHORUS, 1 } } },
+
+        { "Glass Bell",
+          { { P_O1WAVE, 0 }, { P_O2WAVE, 0 }, { P_O2RANGE, 3 }, { P_O2FINE, 3 }, { P_MIX, 0.45f }, { P_XMOD, 0.35f },
+            { P_CUTOFF, 12000 }, { P_RES, 0.05f }, { P_ENVAMT, 0.f }, { P_AA, 0.002f }, { P_AD, 1.8f }, { P_AS, 0.f },
+            { P_AR, 1.6f }, { P_CHORUS, 2 }, { P_SPREAD, 0.8f } } },
+
+        { "Hungry Arp (16th)",
+          { { P_ARPON, 1 }, { P_ARPMODE, 0 }, { P_ARPRATE, 3 }, { P_ARPOCT, 2 }, { P_ARPGATE, 0.5f },
+            { P_O1WAVE, 1 }, { P_O2WAVE, 2 }, { P_PW, 0.4f }, { P_O2FINE, 6 }, { P_CUTOFF, 1400 }, { P_RES, 0.25f },
+            { P_ENVAMT, 0.5f }, { P_FD, 0.22f }, { P_FS, 0.1f }, { P_FR, 0.2f }, { P_AA, 0.002f }, { P_AD, 0.3f },
+            { P_AS, 0.6f }, { P_AR, 0.2f }, { P_CHORUS, 1 } } },
+
+        { "Arp Pad Up/Down",
+          { { P_ARPON, 1 }, { P_ARPMODE, 2 }, { P_ARPRATE, 1 }, { P_ARPOCT, 2 }, { P_ARPGATE, 0.8f },
+            { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 9 }, { P_CUTOFF, 2800 }, { P_ENVAMT, 0.2f },
+            { P_AA, 0.05f }, { P_AS, 0.9f }, { P_AR, 0.7f }, { P_CHORUS, 2 }, { P_SPREAD, 0.9f } } },
+
+        { "Arp Sci-Fi Random",
+          { { P_ARPON, 1 }, { P_ARPMODE, 3 }, { P_ARPRATE, 4 }, { P_ARPOCT, 3 }, { P_ARPGATE, 0.4f },
+            { P_O1WAVE, 0 }, { P_O2WAVE, 2 }, { P_O2RANGE, 2 }, { P_MIX, 0.4f }, { P_XMOD, 0.2f }, { P_CUTOFF, 3000 },
+            { P_RES, 0.4f }, { P_ENVAMT, 0.4f }, { P_FD, 0.3f }, { P_FS, 0.2f }, { P_AD, 0.35f }, { P_AS, 0.4f },
+            { P_AR, 0.5f }, { P_CHORUS, 2 } } },
+
+        { "Arp Bass Sequence",
+          { { P_ARPON, 1 }, { P_ARPMODE, 4 }, { P_ARPRATE, 3 }, { P_ARPOCT, 1 }, { P_ARPGATE, 0.55f },
+            { P_O1WAVE, 1 }, { P_O1RANGE, 0 }, { P_O2WAVE, 2 }, { P_O2RANGE, 1 }, { P_MIX, 0.4f }, { P_CUTOFF, 350 },
+            { P_RES, 0.45f }, { P_ENVAMT, 0.7f }, { P_FA, 0.001f }, { P_FD, 0.16f }, { P_FS, 0.f }, { P_AD, 0.25f },
+            { P_AS, 0.5f }, { P_AR, 0.1f } } },
+
+        { "Choir Voices",
+          { { P_O1WAVE, 2 }, { P_PW, 0.3f }, { P_O2WAVE, 1 }, { P_MIX, 0.4f }, { P_HPF, 300 }, { P_CUTOFF, 1800 },
+            { P_RES, 0.35f }, { P_ENVAMT, 0.1f }, { P_AA, 0.4f }, { P_AS, 1.f }, { P_AR, 0.8f }, { P_FA, 0.5f },
+            { P_FS, 0.9f }, { P_CHORUS, 2 }, { P_LFOPITCH, 0.05f }, { P_LFORATE, 5.f }, { P_LFODELAY, 1.f } } },
+
+        { "Electric Piano",
+          { { P_O1WAVE, 0 }, { P_O2WAVE, 2 }, { P_O2RANGE, 2 }, { P_PW, 0.45f }, { P_O2FINE, 3 }, { P_MIX, 0.3f },
+            { P_CUTOFF, 3000 }, { P_RES, 0.05f }, { P_ENVAMT, 0.3f }, { P_FD, 0.8f }, { P_FS, 0.2f }, { P_AA, 0.002f },
+            { P_AD, 1.4f }, { P_AS, 0.15f }, { P_AR, 0.4f }, { P_VELSENS, 0.85f }, { P_CHORUS, 1 } } },
+
+        { "Organ",
+          { { P_O1WAVE, 3 }, { P_O2WAVE, 3 }, { P_O2RANGE, 2 }, { P_MIX, 0.5f }, { P_CUTOFF, 9000 }, { P_ENVAMT, 0.f },
+            { P_AA, 0.004f }, { P_AS, 1.f }, { P_AR, 0.06f }, { P_VELSENS, 0.f }, { P_CHORUS, 2 } } },
+
+        { "Sweep FX",
+          { { P_NOISE, 0.4f }, { P_O1WAVE, 1 }, { P_O2WAVE, 1 }, { P_O2FINE, 15 }, { P_CUTOFF, 1500 }, { P_RES, 0.6f },
+            { P_ENVAMT, 0.f }, { P_LFOWAVE, 0 }, { P_LFORATE, 0.15f }, { P_LFOFILT, 0.7f }, { P_AA, 2.f }, { P_AS, 1.f },
+            { P_AR, 2.5f }, { P_CHORUS, 2 }, { P_SPREAD, 1.f } } },
+
+        { "Wind Noise",
+          { { P_NOISE, 0.9f }, { P_MIX, 0.f }, { P_O1WAVE, 0 }, { P_HPF, 150 }, { P_CUTOFF, 900 }, { P_RES, 0.5f },
+            { P_ENVAMT, 0.2f }, { P_KEYFOL, 0.8f }, { P_LFOWAVE, 3 }, { P_LFORATE, 0.8f }, { P_LFOFILT, 0.25f },
+            { P_FA, 1.5f }, { P_FS, 1.f }, { P_AA, 1.2f }, { P_AS, 1.f }, { P_AR, 2.f }, { P_SPREAD, 1.f } } },
+    };
+    return list;
+}
+} // namespace jv
+
+// Test hors-ligne du moteur : niveaux, NaN, justesse de hauteur, arpégiateur, WAV de démo.
+#include "../Source/Arp.h"
+#include "../Source/Presets.h"
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+using namespace jv;
+
+static Params applyPreset (const PresetDef& pd)
+{
+    Params p = Params::defaults();
+    for (auto& kv : pd.v) p.v[kv.first] = kv.second;
+    return p;
+}
+
+struct Result { float peak = 0, rms = 0; bool bad = false; std::vector<float> L, R; };
+
+// Joue une séquence de notes [(note, debutSec, dureeSec)] avec le preset donné.
+static Result play (const Params& p, const std::vector<std::tuple<int, double, double>>& notes, double seconds, double bpm = 120.0)
+{
+    const double sr = 44100.0;
+    const int block = 512;
+    Engine eng; eng.prepare (sr, block);
+    Arpeggiator arp; arp.prepare (sr);
+    ArpSettings as; as.mode = (int) p[P_ARPMODE]; as.rate = (int) p[P_ARPRATE]; as.octaves = (int) p[P_ARPOCT]; as.gate = p[P_ARPGATE]; as.hold = p[P_ARPHOLD] > 0.5f;
+    const bool arpOn = p[P_ARPON] > 0.5f;
+
+    Result r;
+    const long total = (long) (seconds * sr);
+    r.L.reserve (total); r.R.reserve (total);
+    std::vector<float> L (block), R (block);
+    std::vector<Ev> in, out, merged;
+    double sumsq = 0;
+    for (long start = 0; start < total; start += block)
+    {
+        in.clear(); out.clear();
+        for (auto& [n, t0, d] : notes)
+        {
+            long on = (long) (t0 * sr), off = (long) ((t0 + d) * sr);
+            if (on >= start && on < start + block) in.push_back ({ (int) (on - start), EV_NOTE_ON, n, 0.8f });
+            if (off >= start && off < start + block) in.push_back ({ (int) (off - start), EV_NOTE_OFF, n, 0.f });
+        }
+        std::stable_sort (in.begin(), in.end(), [] (const Ev& a, const Ev& b) { return a.pos < b.pos; });
+        const std::vector<Ev>* evs = &in;
+        if (arpOn) { arp.process (in, out, block, as, bpm, false, -1.0); evs = &out; }
+        eng.setParams (p);
+        int cur = 0;
+        for (auto& e : *evs)
+        {
+            if (e.pos > cur) { eng.render (L.data() + cur, R.data() + cur, e.pos - cur); cur = e.pos; }
+            eng.handle (e);
+        }
+        if (cur < block) eng.render (L.data() + cur, R.data() + cur, block - cur);
+        for (int i = 0; i < block; ++i)
+        {
+            if (! std::isfinite (L[i]) || ! std::isfinite (R[i])) r.bad = true;
+            r.peak = std::max ({ r.peak, std::fabs (L[i]), std::fabs (R[i]) });
+            sumsq += L[i] * L[i] + R[i] * R[i];
+            r.L.push_back (L[i]); r.R.push_back (R[i]);
+        }
+    }
+    r.rms = (float) std::sqrt (sumsq / (2.0 * total));
+    return r;
+}
+
+static void writeWav (const char* path, const std::vector<float>& L, const std::vector<float>& R)
+{
+    FILE* f = fopen (path, "wb");
+    const uint32_t sr = 44100, n = (uint32_t) L.size(), dataBytes = n * 4, riff = 36 + dataBytes;
+    const uint16_t fmt = 1, ch = 2, bits = 16, align = 4; const uint32_t brate = sr * 4, sixteen = 16;
+    fwrite ("RIFF", 1, 4, f); fwrite (&riff, 4, 1, f); fwrite ("WAVEfmt ", 1, 8, f); fwrite (&sixteen, 4, 1, f);
+    fwrite (&fmt, 2, 1, f); fwrite (&ch, 2, 1, f); fwrite (&sr, 4, 1, f); fwrite (&brate, 4, 1, f);
+    fwrite (&align, 2, 1, f); fwrite (&bits, 2, 1, f); fwrite ("data", 1, 4, f); fwrite (&dataBytes, 4, 1, f);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        int16_t a = (int16_t) (std::max (-1.f, std::min (1.f, L[i])) * 32767), b = (int16_t) (std::max (-1.f, std::min (1.f, R[i])) * 32767);
+        fwrite (&a, 2, 1, f); fwrite (&b, 2, 1, f);
+    }
+    fclose (f);
+}
+
+int main()
+{
+    int failures = 0;
+
+    // 1) Justesse : La3 (69) doit donner ~440 Hz (passages par zéro, filtre grand ouvert, 1 seul osc.)
+    {
+        Params p = Params::defaults();
+        p.v[P_MIX] = 0.f; p.v[P_CUTOFF] = 18000; p.v[P_ENVAMT] = 0; p.v[P_KEYFOL] = 0; p.v[P_O1WAVE] = 0; p.v[P_SPREAD] = 0;
+        p.v[P_AA] = 0.001f; p.v[P_AS] = 1.f; p.v[P_FS] = 1.f; p.v[P_RES] = 0.f;
+        auto r = play (p, { { 69, 0.0, 1.0 } }, 1.0);
+        int zc = 0; for (size_t i = 22050; i + 1 < 44100; ++i) if (r.L[i] <= 0 && r.L[i + 1] > 0) ++zc;
+        double f = zc / (22050.0 / 44100.0);
+        printf ("Justesse La3: %.1f Hz (attendu 440)\n", f);
+        if (std::fabs (f - 440.0) > 3.0) { ++failures; printf ("  ECHEC justesse\n"); }
+    }
+
+    // 2) Tous les presets : accord de 3 notes (ou notes tenues pour l'arp), pas de NaN, niveaux raisonnables
+    printf ("\n%-24s %7s %7s\n", "Preset", "peak", "rms");
+    const auto& list = presets();
+    for (size_t i = 0; i < list.size(); ++i)
+    {
+        Params p = applyPreset (list[i]);
+        auto r = play (p, { { 48, 0.1, 2.5 }, { 55, 0.1, 2.5 }, { 60, 0.1, 2.5 }, { 64, 0.1, 2.5 } }, 4.0);
+        printf ("%-24s %7.3f %7.3f %s\n", list[i].name, r.peak, r.rms, r.bad ? "NaN!" : "");
+        if (r.bad || r.peak > 1.0f || r.rms < 0.005f) { ++failures; printf ("  ECHEC niveau/NaN\n"); }
+    }
+
+    // 3) Arpégiateur : Up, 1/16 à 120 BPM => pas de 11025 samples ; notes C-E-G attendues
+    {
+        Arpeggiator arp; arp.prepare (44100.0);
+        ArpSettings s; s.mode = 0; s.rate = 3; s.octaves = 1; s.gate = 0.5f;
+        std::vector<Ev> in = { { 0, EV_NOTE_ON, 60, 1.f }, { 0, EV_NOTE_ON, 64, 1.f }, { 0, EV_NOTE_ON, 67, 1.f } }, out;
+        arp.process (in, out, 44100, s, 120.0, false, -1.0);
+        printf ("\nArp Up 1/16 @120 (1 s) :");
+        int seq[8], k = 0; std::vector<int> ons;
+        for (auto& e : out) if (e.type == EV_NOTE_ON) { ons.push_back (e.pos); seq[k++ % 8] = e.note; printf (" %d@%d", e.note, e.pos); }
+        printf ("\n");
+        const int expect[] = { 60, 64, 67, 60, 64, 67, 60, 64 };
+        bool ok = ons.size() == 8 || ons.size() == 9;
+        for (int i = 0; i < 8 && i < k; ++i) ok = ok && seq[i] == expect[i];
+        if (! ok) { ++failures; printf ("  ECHEC arp\n"); }
+    }
+
+    // 4) Démos WAV
+    auto demo = [&] (const char* presetName, const std::vector<std::tuple<int, double, double>>& notes, double secs, const char* file)
+    {
+        for (auto& pd : list) if (std::string (pd.name) == presetName)
+        {
+            auto r = play (applyPreset (pd), notes, secs);
+            writeWav (file, r.L, r.R);
+        }
+    };
+    std::vector<float> dL, dR;
+    // Démo combinée
+    struct D { const char* name; std::vector<std::tuple<int, double, double>> notes; double secs; };
+    std::vector<D> ds = {
+        { "Brass Stab (Jump)", { { 60, 0.0, 0.5 }, { 64, 0.0, 0.5 }, { 67, 0.0, 0.5 }, { 72, 0.0, 0.5 }, { 62, 0.9, 0.5 }, { 65, 0.9, 0.5 }, { 69, 0.9, 0.5 }, { 74, 0.9, 0.5 } }, 2.0 },
+        { "Strings Ensemble", { { 57, 0.0, 2.2 }, { 60, 0.0, 2.2 }, { 64, 0.0, 2.2 } }, 3.2 },
+        { "Hungry Arp (16th)", { { 57, 0.0, 3.8 }, { 60, 0.0, 3.8 }, { 64, 0.0, 3.8 } }, 4.0 },
+        { "Resonant Pluck Bass", { { 36, 0.0, 0.2 }, { 36, 0.5, 0.2 }, { 39, 1.0, 0.2 }, { 41, 1.5, 0.4 } }, 2.4 },
+        { "Sync Lead", { { 72, 0.0, 0.7 }, { 75, 0.8, 0.4 }, { 79, 1.3, 1.0 } }, 3.0 },
+    };
+    for (auto& d : ds)
+        for (auto& pd : list) if (std::string (pd.name) == d.name)
+        {
+            auto r = play (applyPreset (pd), d.notes, d.secs);
+            float pk = 0; for (float v : r.L) pk = std::max (pk, std::fabs (v));
+            for (size_t i = 0; i < r.L.size(); ++i) { dL.push_back (r.L[i]); dR.push_back (r.R[i]); }
+            dL.insert (dL.end(), 22050, 0.f); dR.insert (dR.end(), 22050, 0.f);
+        }
+    writeWav ("/home/claude/Jovian8/demo_presets.wav", dL, dR);
+    (void) demo;
+
+    printf ("\n%s (%d echec(s))\n", failures ? "TESTS EN ECHEC" : "TOUS LES TESTS OK", failures);
+    return failures ? 1 : 0;
+}
